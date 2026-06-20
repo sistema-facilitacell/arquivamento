@@ -1520,6 +1520,12 @@ let state = {
 
 // Salva ou atualiza um cliente no Firestore
 async function saveClientToFirestore(clientData) {
+  // Firestore limita cada documento a 1.048.576 bytes. Validamos antes de gravar
+  // para evitar falha silenciosa ou perda de dados.
+  const aprox = new Blob([JSON.stringify(clientData)]).size;
+  if (aprox > 1000 * 1024) {
+    throw new Error(`Cadastro muito grande (${(aprox/1024).toFixed(0)} KB). O limite é ~1 MB por cliente. Remova ou comprima alguns anexos.`);
+  }
   setLoading(true);
   try {
     if (clientData.id) {
@@ -1729,11 +1735,63 @@ function calcParcelaPayjoy() {
 // ═══════════════════════════════════════════════
 // FILE HANDLING
 // ═══════════════════════════════════════════════
+// Limites de arquivamento (Firestore: doc máx 1 MB; deixamos margem p/ os outros campos)
+const MAX_FILE_BYTES  = 900 * 1024;        // 900 KB por arquivo individual
+const MAX_TOTAL_BYTES = 950 * 1024;        // ~950 KB somando todos os anexos do cliente
+const TIPOS_ACEITOS   = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+// Tamanho real (em bytes) do conteúdo base64 de um data URL
+function tamanhoBase64(dataUrl) {
+  const b64 = (String(dataUrl).split(',')[1] || '');
+  return Math.floor(b64.length * 3 / 4);
+}
+// Soma de bytes já anexados (pendentes + existentes do cliente em edição)
+function bytesTotaisAnexados() {
+  let total = state.pendingFiles.reduce((s,f)=>s+(f.bytes||tamanhoBase64(f.data)),0);
+  if(state.editingId){
+    const ex = state.clients.find(c=>c.id===state.editingId)?.files || [];
+    total += ex.reduce((s,f)=>s+(f.bytes||tamanhoBase64(f.data)),0);
+  }
+  return total;
+}
+function fmtBytes(b){ return b < 1024*1024 ? (b/1024).toFixed(0)+' KB' : (b/1024/1024).toFixed(2)+' MB'; }
+
 function handleFiles(fileList) {
   Array.from(fileList).forEach(file => {
+    // Valida tipo
+    if(!TIPOS_ACEITOS.includes(file.type)){
+      showToast(`⚠️ "${file.name}": tipo não aceito (use PDF ou imagem).`, 'error');
+      return;
+    }
+    // Valida duplicata por nome (entre pendentes e já existentes na edição)
+    const existentes = state.editingId ? (state.clients.find(c=>c.id===state.editingId)?.files||[]) : [];
+    if(state.pendingFiles.find(f=>f.name===file.name) || existentes.find(f=>f.name===file.name)){
+      showToast(`⚠️ "${file.name}" já está anexado.`, 'error');
+      return;
+    }
     const reader = new FileReader();
+    reader.onerror = () => showToast(`Erro ao ler "${file.name}".`, 'error');
     reader.onload = e => {
-      state.pendingFiles.push({ name:file.name, type:file.type, size:file.size, data:e.target.result });
+      const data  = e.target.result;
+      const bytes = tamanhoBase64(data);
+      // Tamanho individual
+      if(bytes > MAX_FILE_BYTES){
+        showToast(`⚠️ "${file.name}" tem ${fmtBytes(bytes)} (máx ${fmtBytes(MAX_FILE_BYTES)}). Comprima o arquivo.`, 'error');
+        return;
+      }
+      // Tamanho total acumulado
+      if(bytesTotaisAnexados() + bytes > MAX_TOTAL_BYTES){
+        showToast(`⚠️ Limite total de anexos atingido (${fmtBytes(MAX_TOTAL_BYTES)}). Remova algum arquivo antes.`, 'error');
+        return;
+      }
+      state.pendingFiles.push({
+        id: uuid(),
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        bytes,
+        data
+      });
       renderFilesList();
     };
     reader.readAsDataURL(file);
@@ -1747,18 +1805,61 @@ function dropFiles(e) {
 }
 function renderFilesList() {
   const el = document.getElementById('filesList');
-  if(!state.pendingFiles.length){ el.innerHTML=''; return; }
-  el.innerHTML = state.pendingFiles.map((f,i)=>`
-    <div class="file-item">
-      <span class="file-icon">${f.type.includes('pdf')?'📄':'🖼️'}</span>
-      <div class="file-info">
-        <div class="file-name">${f.name}</div>
-        <div class="file-size">${(f.size/1024).toFixed(1)} KB</div>
+  if(!el) return;
+  const existentes = state.editingId ? (state.clients.find(c=>c.id===state.editingId)?.files||[]) : [];
+
+  if(!existentes.length && !state.pendingFiles.length){ el.innerHTML=''; return; }
+
+  const linhaArquivo = (f, tipo, idx) => {
+    const bytes = f.bytes || tamanhoBase64(f.data);
+    const btn = tipo === 'existente'
+      ? `<button class="file-remove" title="Remover arquivo já salvo" onclick="removeExistingFile('${f.id||''}','${(f.name||'').replace(/'/g,"\\'")}')">🗑️</button>`
+      : `<button class="file-remove" title="Remover" onclick="removeFile(${idx})">🗑️</button>`;
+    const tag = tipo === 'existente'
+      ? `<span style="font-size:9px;background:#e0e7ff;color:#3730a3;border-radius:4px;padding:1px 5px;margin-left:6px;font-weight:700">SALVO</span>`
+      : `<span style="font-size:9px;background:#dcfce7;color:#166534;border-radius:4px;padding:1px 5px;margin-left:6px;font-weight:700">NOVO</span>`;
+    return `
+      <div class="file-item">
+        <span class="file-icon">${(f.type||'').includes('pdf')?'📄':'🖼️'}</span>
+        <div class="file-info">
+          <div class="file-name">${f.name}${tag}</div>
+          <div class="file-size">${fmtBytes(bytes)}</div>
+        </div>
+        ${btn}
+      </div>`;
+  };
+
+  const htmlExistentes = existentes.map(f => linhaArquivo(f,'existente')).join('');
+  const htmlPendentes  = state.pendingFiles.map((f,i) => linhaArquivo(f,'pendente',i)).join('');
+
+  // Medidor de uso total
+  const usado = bytesTotaisAnexados();
+  const pct = Math.min(100, Math.round(usado / MAX_TOTAL_BYTES * 100));
+  const cor = pct < 70 ? '#0E6B3F' : pct < 90 ? '#C27803' : '#B91C1C';
+  const medidor = `
+    <div style="margin-top:8px;font-size:11px;color:var(--text-sub)">
+      <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+        <span>Armazenamento de anexos</span>
+        <span style="font-family:'IBM Plex Mono',monospace;color:${cor};font-weight:700">${fmtBytes(usado)} / ${fmtBytes(MAX_TOTAL_BYTES)}</span>
       </div>
-      <button class="file-remove" onclick="removeFile(${i})">🗑️</button>
-    </div>`).join('');
+      <div style="height:5px;background:#e5e7eb;border-radius:3px;overflow:hidden">
+        <div style="height:100%;width:${pct}%;background:${cor};transition:width .2s"></div>
+      </div>
+    </div>`;
+
+  el.innerHTML = htmlExistentes + htmlPendentes + medidor;
 }
 function removeFile(i) { state.pendingFiles.splice(i,1); renderFilesList(); }
+
+// Remove um arquivo JÁ SALVO no cliente que está sendo editado
+function removeExistingFile(fileId, fileName) {
+  if(!state.editingId) return;
+  const c = state.clients.find(x=>x.id===state.editingId);
+  if(!c || !c.files) return;
+  if(!confirm(`Remover o arquivo "${fileName}" deste cliente?\n\nA remoção será efetivada ao salvar o cadastro.`)) return;
+  c.files = c.files.filter(f => fileId ? f.id !== fileId : f.name !== fileName);
+  renderFilesList();
+}
 
 // ═══════════════════════════════════════════════
 // CRUD
@@ -1853,13 +1954,9 @@ async function saveClient() {
   try {
     if(state.editingId) {
       const existing = state.clients.find(c=>c.id===state.editingId);
-      if(existing) {
-        if(!state.pendingFiles.length && existing.files) {
-          clientData.files = existing.files;
-        } else if(state.pendingFiles.length && existing.files?.length) {
-          clientData.files = [...existing.files, ...state.pendingFiles];
-        }
-      }
+      // existing.files já reflete remoções feitas via removeExistingFile()
+      const filesExistentes = existing?.files || [];
+      clientData.files = [...filesExistentes, ...state.pendingFiles];
       clientData.id = state.editingId;
       await saveClientToFirestore(clientData);
       showToast('Cliente atualizado com sucesso! ✅','success');
@@ -2339,6 +2436,13 @@ function openEditModal(id) {
   if(!c) return;
   state.editingId = id;
   state.pendingFiles = [];
+  // Normaliza anexos de registros antigos (sem id/bytes) para o preview e o medidor funcionarem
+  if(Array.isArray(c.files)){
+    c.files.forEach(f => {
+      if(!f.id)    f.id = uuid();
+      if(!f.bytes) f.bytes = tamanhoBase64(f.data);
+    });
+  }
   document.getElementById('addModalTitle').textContent = '✏️ Editar Cliente';
   document.getElementById('fName').value=c.name;
   document.getElementById('fCPF').value=c.cpf;
@@ -2408,8 +2512,8 @@ function openViewModal(id) {
     <div class="view-files-section">
       <h4>📎 Documentos Anexados (${c.files.length})</h4>
       <div class="files-preview">
-        ${c.files.map(f=>`
-          <div class="file-preview-card" onclick="previewFile('${f.data.substring(0,30)}','${c.id}','${f.name}')">
+        ${c.files.map((f,fi)=>`
+          <div class="file-preview-card" onclick="previewFile('${c.id}','${f.id||''}',${fi})">
             ${f.type.startsWith('image/')
               ? `<img src="${f.data}" alt="${f.name}">`
               : `<div class="pdf-thumb">📄</div>`}
@@ -2491,9 +2595,12 @@ function openViewModal(id) {
   openModal('modalView');
 }
 
-function previewFile(dataStart, clientId, fileName) {
+function previewFile(clientId, fileId, fileIndex) {
   const c = state.clients.find(x=>x.id===clientId);
-  const file = c?.files?.find(f=>f.data.startsWith(dataStart));
+  if(!c?.files) return;
+  // Localiza por id único; se não houver id (registros antigos), usa o índice
+  let file = fileId ? c.files.find(f=>f.id===fileId) : null;
+  if(!file && typeof fileIndex === 'number') file = c.files[fileIndex];
   if(!file) return;
 
   // Remove viewer anterior se existir
@@ -2633,9 +2740,24 @@ function snapPhoto() {
   canvas.width  = video.videoWidth;
   canvas.height = video.videoHeight;
   canvas.getContext('2d').drawImage(video, 0, 0);
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-  const name    = `foto_${new Date().toISOString().replace(/[:.]/g,'-')}.jpg`;
-  state.pendingFiles.push({ name, type: 'image/jpeg', size: Math.round(dataUrl.length * 0.75), data: dataUrl });
+
+  // Comprime progressivamente até caber no limite individual
+  let q = 0.85, dataUrl = canvas.toDataURL('image/jpeg', q);
+  while(tamanhoBase64(dataUrl) > MAX_FILE_BYTES && q > 0.35){
+    q -= 0.1;
+    dataUrl = canvas.toDataURL('image/jpeg', q);
+  }
+  const bytes = tamanhoBase64(dataUrl);
+  if(bytes > MAX_FILE_BYTES){
+    showToast(`Foto muito grande mesmo após compressão (${fmtBytes(bytes)}). Tente outra.`, 'error');
+    return;
+  }
+  if(bytesTotaisAnexados() + bytes > MAX_TOTAL_BYTES){
+    showToast(`⚠️ Limite total de anexos atingido (${fmtBytes(MAX_TOTAL_BYTES)}). Remova algum arquivo antes.`, 'error');
+    return;
+  }
+  const name = `foto_${new Date().toISOString().replace(/[:.]/g,'-')}.jpg`;
+  state.pendingFiles.push({ id: uuid(), name, type: 'image/jpeg', size: bytes, bytes, data: dataUrl });
   renderFilesList();
   closeCamera();
   showToast('Foto capturada com sucesso! 📸', 'success');
@@ -4052,16 +4174,8 @@ async function importarPDFFile(file) {
       if (sel) { sel.value = '8'; calcParcelaOdescred(); filled.push('Plano 8x (14d)'); }
     }
 
-    // ── 4. Salvar PDF nos documentos do cliente ──
-    const reader = new FileReader();
-    reader.onload = e => {
-      const jaExiste = state.pendingFiles.find(f => f.name === file.name);
-      if (!jaExiste) {
-        state.pendingFiles.push({ name: file.name, type: file.type, size: file.size, data: e.target.result });
-        renderFilesList();
-      }
-    };
-    reader.readAsDataURL(file);
+    // ── 4. Salvar PDF nos documentos do cliente (usa o pipeline unificado) ──
+    handleFiles([file]);
 
     // ── 5. Mostrar resultado ──
     const nFilled = filled.length;
